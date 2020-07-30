@@ -1,0 +1,142 @@
+---
+- hosts: all
+  become: yes
+  gather_facts: no
+  vars:
+    # to make sure no typos happen
+    my_var_enforce_gtid_consistency: enforce_gtid_consistency
+    my_var_gtid_mode: gtid_mode
+
+    # override in the command line to skip package checks
+    skip_install_package: no
+
+    # needed by the ansible mysql modules. Change for a different name or version
+    mysql_python_packages:
+      - MySQL-python-1.2.5-1.el7.x86_64
+
+    # The line after which the gtid config entries will be inserted into
+    # /etc/my.cnf. Change this to say '[mysqld]' if you want it to work
+    # regardless of whether 'binlog_format' is mentioned in the config.
+    my_cnf_insert_after: '^binlog_format'
+
+  tasks:
+    - name: Install required packages
+      package:
+        name: "{{ mysql_python_packages }}"
+        state: present
+      when: not skip_install_package|bool
+
+    - name: "Current mysql variable and status"
+      block:
+        - name: Current mysql variable and status | Fetch variables
+          mysql_variables:
+              variable: "{{ item }}"
+          register: mysql_vars
+          loop:
+            - "{{ my_var_enforce_gtid_consistency }}"
+            - "{{ my_var_gtid_mode }}"
+          check_mode: no
+
+        - name: Current mysql variable and status | Fetch slave status
+          mysql_replication:
+              mode: "getslave"
+          register: mysql_slave_status
+          check_mode: no
+          when: '"follower" in group_names'
+          no_log: yes
+
+        - name: Current mysql variable and status | Fetch status
+          shell:
+            cmd: >
+              mysql -uroot -B -e  "SHOW STATUS LIKE 'ONGOING_ANONYMOUS_TRANSACTION_COUNT'" | tail -n 1 | cut -f 2
+          register: my_anon_txn_count
+          check_mode: no
+          changed_when: false
+
+        - name: Current mysql variable and status | Set facts
+          set_fact:
+            mysql_state:
+              enforce_gtid_consistency: "{{ mysql_vars.results[0].msg }}"
+              gtid_mode: "{{ mysql_vars.results[1].msg }}"
+              ongoing_txn_count: "{{ my_anon_txn_count.stdout }}"
+              slave_lag: "{{ mysql_slave_status.Seconds_Behind_Master | default(-1) | int }}"
+              master_auto_pos: "{{ mysql_slave_status.Auto_Position | default(-1) | int }}"
+              is_leader: "{{ 'leader' in group_names }}"
+
+        - name: Current mysql variable and status | Display status
+          debug:
+            var: mysql_state
+
+    - name: Validate input variables
+      fail:
+          msg: "Provide value for 'gtid_migration_phase' (1-4) in the command line"
+      when:
+        - not ansible_check_mode
+        - "(gtid_migration_phase|default(-1)|int < 0) or (gtid_migration_phase|default(-1)|int > 4)"
+
+    - name: "Phase 1: Turn on warnings for GTID consistency issues in queries"
+      mysql_variables:
+          variable: "{{ item.var }}"
+          value: "{{ item.val }}"
+      loop:
+        - {var: "{{ my_var_enforce_gtid_consistency }}", val: "WARN"}
+        - {var: "{{ my_var_gtid_mode }}", val: "OFF"}
+      when: "(not ansible_check_mode) and (gtid_migration_phase|int == 1)"
+
+    - name: "Phase 2: Enforce GTID consistency/GTID mode is OFF_PERMISSIVE"
+      mysql_variables:
+          variable: "{{ item.var }}"
+          value: "{{ item.val }}"
+      loop:
+        - {var: "{{ my_var_enforce_gtid_consistency }}", val: "ON"}
+        - {var: "{{ my_var_gtid_mode }}", val: "OFF_PERMISSIVE"}
+      when: "(not ansible_check_mode) and (gtid_migration_phase|int == 2)"
+
+    - name: "Phase 3: GTID mode is ON_PERMISSIVE"
+      mysql_variables:
+          variable: "{{ item.var }}"
+          value: "{{ item.val }}"
+      loop:
+        - {var: "{{ my_var_enforce_gtid_consistency }}", val: "ON"}
+        - {var: "{{ my_var_gtid_mode }}", val: "ON_PERMISSIVE"}
+      when: "(not ansible_check_mode) and (gtid_migration_phase|int == 3)"
+
+    - name: "Phase 4: GTID mode is ON!"
+      when: "(not ansible_check_mode) and (gtid_migration_phase|int == 4)"
+      block:
+
+        - name: "Phase 4: GTID mode is ON! | Set variable on server"
+          mysql_variables:
+              variable: "{{ item.var }}"
+              value: "{{ item.val }}"
+          loop:
+            - {var: "{{ my_var_enforce_gtid_consistency }}", val: "ON"}
+            - {var: "{{ my_var_gtid_mode }}", val: "ON"}
+
+        - name: "Phase 4: GTID mode is ON! | Add to mysql config"
+          lineinfile:
+              path: "/etc/my.cnf"
+              state: present
+              regexp: "{{ item.regexp }}"
+              backup: yes
+              line: "{{ item.line }}"
+              insertafter: "{{ my_cnf_insert_after }}"
+          loop:
+          - {regexp: '.*gtid_mode\s*=', line: 'gtid_mode = ON'}
+          - {regexp: '.*enforce_gtid_consistency\s*=', line: 'enforce_gtid_consistency = ON'}
+
+        - name: "Phase 4: GTID mode is ON! | Switch replication to GTID protocol"
+          when: '(not mysql_state.is_leader) and (mysql_state.master_auto_pos == 0)'
+          block:
+            - name: "Phase 4: GTID mode is ON! | Switch replication to GTID protocol | Stop replication"
+              mysql_replication:
+                mode: stopslave
+
+            - name: "Phase 4: GTID mode is ON! | Switch replication to GTID protocol | change master to auto position"
+              mysql_replication:
+                mode: changemaster
+                master_auto_position: yes
+
+            - name: "Phase 4: GTID mode is ON! | Switch replication to GTID protocol | Start replication"
+              mysql_replication:
+                mode: startslave

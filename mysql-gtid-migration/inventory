@@ -1,0 +1,6 @@
+[leader]
+mysql-leader.example.com
+
+[follower]
+mysql-follower1.example.com
+mysql-follower2.example.com
